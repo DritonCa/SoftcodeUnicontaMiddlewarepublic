@@ -1,0 +1,31 @@
+# Public demo with fictional data, e.g. behind a reverse proxy as demo.example.com.
+# Secrets come from deploy/.env (never committed):
+#   JWT_KEY=<64 random hex chars>   AUTH_PEPPER=<32 random hex chars>   TURNSTILE_SECRET=<optional>
+services:
+  middleware-demo:
+    build: ..
+    container_name: softcode-uniconta-demo
+    restart: unless-stopped
+    environment:
+      Jwt__Key: ${JWT_KEY:?set JWT_KEY in deploy/.env}
+      Auth__SecretPepper: ${AUTH_PEPPER:?set AUTH_PEPPER in deploy/.env}
+      Erp__DataSource: Demo
+      Swagger__Enabled: "true"
+      Demo__TurnstileSecret: ${TURNSTILE_SECRET:-}
+      Demo__AllowedOrigins__0: ${DEMO_ORIGIN:-https://softcode.dk}
+      Network__TrustCloudflareHeader: ${TRUST_CLOUDFLARE:-false}
+    volumes:
+      - demo-data:/data
+      - demo-keys:/app/dataprotection-keys
+      - demo-logs:/app/logs
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 384m
+
+volumes:
+  demo-data:
+  demo-keys:
+  demo-logs:

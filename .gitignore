@@ -1,0 +1,37 @@
+## Build results
+bin/
+obj/
+publish/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.cache
+*.log
+*.tmp
+*.db
+*.sln
+## Rider
+.idea/
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Secrets
+appsettings.Development.json
+appsettings.Production.json
+
+dataprotection-keys/
+
+
+## Runtime logs
+logs/
+
+## Local build/publish output and SQLite side files
+publish*/
+udgivelse/
+*.db-shm
+*.db-wal
+.env

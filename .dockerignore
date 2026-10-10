@@ -1,0 +1,12 @@
+bin/
+obj/
+Tests/
+.git/
+.github/
+*.db
+*.db-*
+dataprotection-keys/
+logs/
+appsettings.Development.json
+appsettings.Production.json
+.env
