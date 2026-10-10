@@ -4,9 +4,12 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using SoftcodeUnicontaMiddleware.Data;
 using SoftcodeUnicontaMiddleware.Data.Entities;
 using SoftcodeUnicontaMiddleware.Services;
+using SoftcodeUnicontaMiddleware.Services.Erp;
+using System.Net;
 using System.Security.Claims;
 using System.Security.Cryptography;
 
@@ -23,24 +26,61 @@ public class AdminController : ControllerBase
 {
     public const string CookieScheme = "AdminCookie";
 
+    /// <summary>Data Protection purpose for the reversible copy of client secrets.</summary>
+    public const string SecretPurpose = "SoftcodeUnicontaMiddleware.ClientSecrets";
+
     private readonly IAdminUserService _users;
     private readonly OrderLogReader _logReader;
     private readonly AppDbContext _db;
     private readonly SecretHasher _hasher;
     private readonly IDataProtector _secrets;
+    private readonly ErpOptions _erp;
+    private readonly IConfiguration _config;
+    private readonly IWebHostEnvironment _env;
 
     public AdminController(
         IAdminUserService users,
         OrderLogReader logReader,
         AppDbContext db,
         SecretHasher hasher,
-        IDataProtectionProvider dp)
+        IDataProtectionProvider dp,
+        IOptions<ErpOptions> erp,
+        IConfiguration config,
+        IWebHostEnvironment env)
     {
         _users     = users;
         _logReader = logReader;
         _db        = db;
         _hasher    = hasher;
-        _secrets   = dp.CreateProtector("SoftcodeUnicontaMiddleware.ClientSecrets");
+        _secrets   = dp.CreateProtector(SecretPurpose);
+        _erp       = erp.Value;
+        _config    = config;
+        _env       = env;
+    }
+
+    private Task<bool> AnyAdminAsync() =>
+        _db.AdminUsers.AnyAsync(u => u.Role == AdminUser.RoleAdmin && u.IsActive);
+
+    private bool SwaggerOn => _env.IsDevelopment() || _config.GetValue<bool>("Swagger:Enabled");
+
+    /// <summary>
+    /// The first admin may only be created from the server itself, or with the
+    /// configured Admin:SetupToken. Otherwise the first stranger to open /admin on a
+    /// fresh, internet-facing install would become its administrator.
+    /// </summary>
+    private bool SetupAllowedHere()
+    {
+        var ip = HttpContext.Connection.RemoteIpAddress;
+        if (ip != null && IPAddress.IsLoopback(ip))
+            return true;
+
+        var token = _config["Admin:SetupToken"];
+        if (string.IsNullOrEmpty(token))
+            return false;
+
+        var sent = Request.Headers["X-Setup-Token"].FirstOrDefault() ?? "";
+        return CryptographicOperations.FixedTimeEquals(
+            System.Text.Encoding.UTF8.GetBytes(sent), System.Text.Encoding.UTF8.GetBytes(token));
     }
 
     public class Credentials
@@ -69,7 +109,7 @@ public class AdminController : ControllerBase
     [AllowAnonymous]
     public async Task<IActionResult> Status()
     {
-        var setupRequired = !await _users.AnyExistsAsync();
+        var setupRequired = !await AnyAdminAsync();
         var auth          = await HttpContext.AuthenticateAsync(CookieScheme);
 
         var me = auth.Succeeded ? await CurrentUser() : null;
@@ -82,7 +122,9 @@ public class AdminController : ControllerBase
             role          = me?.Role,
             isAdmin       = me?.IsAdmin ?? false,
             email         = me?.Email,
-            companies     = me?.AllowedCompanies()
+            companies     = me?.AllowedCompanies(),
+            demo          = _erp.IsDemo,
+            swagger       = SwaggerOn
         });
     }
 
@@ -91,8 +133,13 @@ public class AdminController : ControllerBase
     [EnableRateLimiting("auth")]
     public async Task<IActionResult> Setup([FromBody] Credentials c)
     {
-        if (await _users.AnyExistsAsync())
+        if (await AnyAdminAsync())
             return Conflict(new { message = "Opsætning er allerede gennemført." });
+        if (!SetupAllowedHere())
+            return StatusCode(StatusCodes.Status403Forbidden, new
+            {
+                message = "Den første administrator kan kun oprettes fra serveren selv eller med opsætningsnøglen (Admin:SetupToken)."
+            });
 
         var user = await _users.CreateFirstAsync(c.Username, c.Password);
         if (user == null)
@@ -388,14 +435,52 @@ public class AdminController : ControllerBase
     /// <summary>Full multi-line failure detail (exception/stack + rejected fields).</summary>
     [HttpGet("/admin/api/errors")]
     [Authorize(AuthenticationSchemes = CookieScheme)]
-    public IActionResult Errors() => Ok(new { text = _logReader.ReadErrorLog() });
+    public async Task<IActionResult> Errors()
+    {
+        // The error log spans every company, so only an administrator may read it.
+        if (await RequireAdmin() is { } denied) return denied;
+        return Ok(new { text = _logReader.ReadErrorLog() });
+    }
+
+    /// <summary>
+    /// "My access": the API credentials of the companies the user may see, with the
+    /// secret revealed, so a customer can connect their webshop or try Swagger.
+    /// </summary>
+    [HttpGet("/admin/api/access")]
+    [Authorize(AuthenticationSchemes = CookieScheme)]
+    public async Task<IActionResult> Access()
+    {
+        var me = await CurrentUser();
+        if (me == null) return Unauthorized();
+
+        var rows = _db.Clients
+            .Include(c => c.Tenant)
+            .AsNoTracking()
+            .OrderBy(c => c.CreatedAt)
+            .ToList()
+            .Where(c => MaySee(me, c.ClientId))
+            .Select(c => new
+            {
+                clientId  = c.ClientId,
+                company   = c.Tenant?.Name ?? c.ClientId,
+                isActive  = c.IsActive && (c.ExpiresAt == null || c.ExpiresAt > DateTime.UtcNow),
+                expiresAt = c.ExpiresAt.HasValue ? DateTime.SpecifyKind(c.ExpiresAt.Value, DateTimeKind.Utc) : (DateTime?)null,
+                secret    = RevealSecret(c.ClientSecretEnc)
+            })
+            .ToList();
+
+        return Ok(new { demo = _erp.IsDemo, swagger = SwaggerOn, clients = rows });
+    }
 
     // ---- Companies -------------------------------------------------------------
 
     [HttpGet("/admin/api/companies")]
     [Authorize(AuthenticationSchemes = CookieScheme)]
-    public IActionResult Companies()
+    public async Task<IActionResult> Companies()
     {
+        // Every company's secret is listed here, so this is an administrator view.
+        if (await RequireAdmin() is { } denied) return denied;
+
         var rows = _db.Clients
             .Include(c => c.Tenant)
             .AsNoTracking()
@@ -425,6 +510,10 @@ public class AdminController : ControllerBase
         if (string.IsNullOrWhiteSpace(r.ClientId) || secret.Length < 16)
             return BadRequest(new { message = "Client-id kræves og hemmeligheden skal være mindst 16 tegn." });
 
+        var me = await CurrentUser();
+        if (me == null) return Unauthorized();
+        if (!MaySee(me, r.ClientId)) return Forbid();
+
         var client = await _db.Clients.FirstOrDefaultAsync(c => c.ClientId == r.ClientId);
         if (client == null)
             return NotFound(new { message = "Klienten findes ikke." });
@@ -439,6 +528,8 @@ public class AdminController : ControllerBase
     [Authorize(AuthenticationSchemes = CookieScheme)]
     public async Task<IActionResult> CreateCompany([FromBody] NewCompanyReq r)
     {
+        if (await RequireAdmin() is { } denied) return denied;
+
         var name     = (r.Name ?? "").Trim();
         var clientId = (r.ClientId ?? "").Trim();
         if (name.Length < 2 || clientId.Length < 3)
@@ -476,6 +567,16 @@ public class AdminController : ControllerBase
         var bytes = RandomNumberGenerator.GetBytes(24);
         return Convert.ToBase64String(bytes)
             .Replace("+", "").Replace("/", "").Replace("=", "");
+    }
+
+    internal static Task SignInAsync(HttpContext http, string username)
+    {
+        var identity  = new ClaimsIdentity(new[] { new Claim(ClaimTypes.Name, username) }, CookieScheme);
+        return http.SignInAsync(CookieScheme, new ClaimsPrincipal(identity), new AuthenticationProperties
+        {
+            IsPersistent = true,
+            ExpiresUtc   = DateTimeOffset.UtcNow.AddHours(8)
+        });
     }
 
     private Task SignInAsync(string username)
@@ -531,6 +632,19 @@ public class AdminController : ControllerBase
   .secret { font-family:ui-monospace,Menlo,Consolas,monospace; color:#e2e8f0; }
   .linkbtn { background:transparent; border:0; color:var(--accent); cursor:pointer; padding:0 6px; font-size:12px; font-weight:600; }
   .muted-note { color:var(--muted); font-style:italic; }
+  .switch { margin-top:16px; font-size:13px; color:var(--muted); }
+  .switch a { color:var(--accent); cursor:pointer; text-decoration:none; font-weight:600; }
+  .demo-badge { display:inline-block; background:#0e7490; color:#ecfeff; border-radius:999px; padding:2px 10px; font-size:11px; font-weight:700; margin-left:10px; letter-spacing:.04em; }
+  .access-card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:20px; margin-bottom:16px; }
+  .access-card h3 { margin:0 0 4px; font-size:16px; }
+  .kv { display:grid; grid-template-columns:140px 1fr; gap:8px 12px; margin-top:14px; font-size:13px; align-items:center; }
+  .kv .k { color:var(--muted); }
+  .steps { margin:14px 0 0; padding-left:20px; color:var(--muted); font-size:13px; line-height:1.7; }
+  .steps code { color:var(--txt); }
+  .btnrow { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
+  a.btn { display:inline-block; text-decoration:none; border-radius:6px; padding:9px 14px; font-size:14px; background:var(--accent); color:#04222a; font-weight:600; }
+  a.btn.ghost, button.ghost2 { background:transparent; color:var(--txt); border:1px solid var(--line); }
+  @media (max-width:640px) { .kv { grid-template-columns:1fr; } header { flex-wrap:wrap; gap:8px; } }
   [hidden] { display:none !important; }
 
   /* dashboard */
@@ -561,8 +675,9 @@ public class AdminController : ControllerBase
 </head>
 <body>
 <header>
-  <h1>SOFTCODE · UNICONTA MIDDLEWARE</h1>
+  <h1>SOFTCODE · UNICONTA MIDDLEWARE<span class="demo-badge" id="demoBadge" hidden>DEMO</span></h1>
   <div id="hdrRight" hidden>
+    <button class="ghost navbtn" id="navAccess">Min adgang</button>
     <button class="ghost navbtn" id="navDash">Dashboard</button>
     <button class="ghost navbtn" id="navCompanies">Virksomheder</button>
     <button class="ghost navbtn" id="navUsers" hidden>Brugere</button>
@@ -582,6 +697,8 @@ public class AdminController : ControllerBase
   <input id="suPass" type="password" autocomplete="new-password">
   <label>Gentag adgangskode</label>
   <input id="suPass2" type="password" autocomplete="new-password">
+  <label>Opsætningsnøgle (kun når du ikke er på serveren selv)</label>
+  <input id="suToken" type="password" autocomplete="off">
   <div class="row-actions"><button id="suBtn">Opret og log ind</button></div>
   <div class="msg err" id="suMsg"></div>
 </div>
@@ -596,6 +713,47 @@ public class AdminController : ControllerBase
   <input id="liPass" type="password" autocomplete="current-password">
   <div class="row-actions"><button id="liBtn">Log ind</button></div>
   <div class="msg err" id="liMsg"></div>
+  <p class="switch" id="toSignupWrap" hidden>Ny her? <a id="toSignup">Opret en demokonto</a></p>
+</div>
+
+<!-- SIGN-UP (demo only) -->
+<div id="signupView" class="card" hidden>
+  <h2>Opret demokonto</h2>
+  <p>Få din egen demo med fiktive data: API-nøgler, ordrelog og Swagger. Intet rører et rigtigt regnskab, og kontoen virker i 14 dage.</p>
+  <label>E-mail (dit brugernavn)</label>
+  <input id="sgEmail" type="email" autocomplete="email">
+  <label>Firma (valgfrit)</label>
+  <input id="sgCompany" autocomplete="organization">
+  <label>Adgangskode (min. 8 tegn)</label>
+  <input id="sgPass" type="password" autocomplete="new-password">
+  <label>Gentag adgangskode</label>
+  <input id="sgPass2" type="password" autocomplete="new-password">
+  <input id="sgWebsite" tabindex="-1" autocomplete="off" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;">
+  <div class="row-actions"><button id="sgBtn">Opret demokonto</button></div>
+  <div class="msg err" id="sgMsg"></div>
+  <p class="switch">Har du allerede en konto? <a id="toLogin">Log ind</a></p>
+</div>
+
+<!-- MY ACCESS -->
+<div id="accessView" class="wrap" hidden>
+  <div class="toolbar">
+    <strong style="font-size:14px;">Min adgang</strong>
+    <span class="status" id="accStatus"></span>
+  </div>
+  <div id="accCards"></div>
+  <div class="access-card" id="accHelp">
+    <h3>Sådan kommer du i gang</h3>
+    <ol class="steps">
+      <li>Åbn <strong>Swagger</strong> og klik <strong>Authorize</strong>. Indsæt client id og secret i <code>X-Client-Id</code> og <code>X-Client-Secret</code>.</li>
+      <li>Kør <code>POST /api/auth/login</code><span id="accLoginBody"> med body <code>{}</code></span> og kopiér <code>access_token</code>.</li>
+      <li>Klik <strong>Authorize</strong> igen, indsæt tokenet under <strong>Bearer</strong>, og kør fx <code>GET /api/uniconta/products</code> eller <code>POST /api/uniconta/orders</code>.</li>
+      <li>Følg dine ordrer under <strong>Dashboard</strong> → Ordre-log.</li>
+    </ol>
+    <div class="btnrow">
+      <a class="btn" id="accSwagger" href="/swagger" target="_blank" rel="noopener">Åbn Swagger</a>
+      <a class="btn ghost" href="https://github.com/DritonCa/SoftcodeUnicontaMiddlewarepublic" target="_blank" rel="noopener">Koden på GitHub</a>
+    </div>
+  </div>
 </div>
 
 <!-- DASHBOARD -->
@@ -750,8 +908,10 @@ let me = { isAdmin:false, companies:[] };
 let allCompanies = [];          // [{clientId, company}] for the access checkboxes
 
 function show(view) {
-  for (const v of ['setupView','loginView','dashView','logView','companiesView','usersView']) $('#'+v).hidden = (v !== view);
-  $('#hdrRight').hidden = ['setupView','loginView'].includes(view);
+  for (const v of ['setupView','loginView','signupView','accessView','dashView','logView','companiesView','usersView']) $('#'+v).hidden = (v !== view);
+  $('#hdrRight').hidden = ['setupView','loginView','signupView'].includes(view);
+  $('#navAccess').classList.toggle('active', view === 'accessView');
+  if (view === 'accessView') { loadAccess(); }
   $('#navDash').classList.toggle('active', view === 'dashView' || view === 'logView');
   $('#navCompanies').classList.toggle('active', view === 'companiesView');
   $('#navUsers').classList.toggle('active', view === 'usersView');
@@ -764,12 +924,24 @@ function show(view) {
 
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
+const params = new URLSearchParams(location.search);
+let status = {};
+
+// Where to go after login: Swagger if that is what sent the user here, otherwise the
+// customer's own access page (an administrator starts on the dashboard).
+function landing() {
+  if (params.get('next') === 'swagger' && status.swagger) { location.href = '/swagger/'; return; }
+  show(me.isAdmin ? 'dashView' : 'accessView');
+}
+
 async function boot() {
-  const s = await (await api('status')).json();
-  if (s.setupRequired) return show('setupView');
-  if (!s.authenticated) return show('loginView');
-  applyMe(s);
-  show('dashView');
+  status = await (await api('status')).json();
+  $('#demoBadge').hidden = !status.demo;
+  $('#toSignupWrap').hidden = !status.demo;
+  if (status.setupRequired) return show('setupView');
+  if (!status.authenticated) return show(status.demo && location.hash === '#opret' ? 'signupView' : 'loginView');
+  applyMe(status);
+  landing();
 }
 
 function applyMe(s) {
@@ -788,21 +960,84 @@ $('#suBtn').onclick = async () => {
   const u = $('#suUser').value.trim(), p = $('#suPass').value, p2 = $('#suPass2').value;
   $('#suMsg').textContent = '';
   if (p !== p2) { $('#suMsg').textContent = 'Adgangskoderne er ikke ens.'; return; }
-  const r = await api('setup', { method:'POST', body: JSON.stringify({ username:u, password:p }) });
+  const token = $('#suToken').value.trim();
+  const r = await fetch('/admin/api/setup', { method:'POST',
+    headers: Object.assign({'Content-Type':'application/json'}, token ? {'X-Setup-Token': token} : {}),
+    body: JSON.stringify({ username:u, password:p }) });
   if (r.ok) { await refreshMe(); show('dashView'); }
   else { $('#suMsg').textContent = (await r.json().catch(()=>({}))).message || 'Kunne ikke oprette.'; }
 };
 
 $('#liBtn').onclick = async () => {
-  const u = $('#liUser').value.trim(), p = $('#liPass').value;
+  let u = $('#liUser').value.trim(); const p = $('#liPass').value;
+  if (u.includes('@')) u = u.toLowerCase();   // demo accounts use the e-mail as username
   $('#liMsg').textContent = '';
   const r = await api('login', { method:'POST', body: JSON.stringify({ username:u, password:p }) });
-  if (r.ok) { await refreshMe(); show('dashView'); }
+  if (r.ok) { await refreshMe(); landing(); }
   else { $('#liMsg').textContent = (await r.json().catch(()=>({}))).message || 'Login mislykkedes.'; }
 };
 $('#liPass').addEventListener('keydown', e => { if (e.key === 'Enter') $('#liBtn').click(); });
 
 $('#logoutBtn').onclick = async () => { await api('logout', { method:'POST' }); show('loginView'); };
+$('#navAccess').onclick = () => show('accessView');
+$('#toSignup').onclick = () => { history.replaceState(null, '', '#opret'); show('signupView'); };
+$('#toLogin').onclick = () => { history.replaceState(null, '', location.pathname + location.search); show('loginView'); };
+
+$('#sgBtn').onclick = async () => {
+  const email = $('#sgEmail').value.trim().toLowerCase(), p = $('#sgPass').value, p2 = $('#sgPass2').value;
+  $('#sgMsg').textContent = '';
+  if (p !== p2) { $('#sgMsg').textContent = 'Adgangskoderne er ikke ens.'; return; }
+  $('#sgBtn').disabled = true;
+  try {
+    const r = await fetch('/api/demo/signup', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ email, password:p, company: $('#sgCompany').value.trim(), website: $('#sgWebsite').value }) });
+    if (r.ok) { history.replaceState(null, '', location.pathname); await refreshMe(); show('accessView'); return; }
+    if (r.status === 429) { $('#sgMsg').textContent = 'Der er oprettet for mange konti fra din forbindelse. Prøv igen om en time.'; return; }
+    $('#sgMsg').textContent = (await r.json().catch(()=>({}))).error || 'Kontoen kunne ikke oprettes.';
+  } catch { $('#sgMsg').textContent = 'Noget gik galt. Prøv igen.'; }
+  finally { $('#sgBtn').disabled = false; }
+};
+$('#sgPass2').addEventListener('keydown', e => { if (e.key === 'Enter') $('#sgBtn').click(); });
+
+async function loadAccess() {
+  $('#accStatus').textContent = 'Henter …';
+  let r;
+  try { r = await api('access'); } catch { return; }
+  if (r.status === 401) { show('loginView'); return; }
+  if (!r.ok) { $('#accStatus').textContent = 'Kunne ikke hente.'; return; }
+  const d = await r.json();
+  $('#accSwagger').hidden = !d.swagger;
+  $('#accLoginBody').innerHTML = d.demo ? ' med body <code>{}</code>' : ' med din Uniconta-bruger, adgangskode og API-nøgle i body';
+  $('#accCards').innerHTML = (d.clients || []).map((c, i) => {
+    const exp = c.expiresAt ? new Date(c.expiresAt).toLocaleString('da-DK', { dateStyle:'long', timeStyle:'short' }) : 'Udløber ikke';
+    const secret = c.secret
+      ? '<span class="secret" id="asec'+i+'" data-v="'+esc(c.secret)+'">••••••••••••••••</span>'+
+        '<button class="linkbtn" id="asecbtn'+i+'" onclick="toggleAccSecret('+i+')">Vis</button>'+
+        '<button class="linkbtn" onclick="copyText(\''+esc(c.secret)+'\')">Kopiér</button>'
+      : '<span class="muted-note">ikke gemt — bed en administrator om en ny</span>';
+    return '<div class="access-card">'+
+      '<h3>'+esc(c.company)+'</h3>'+
+      '<div class="muted-note" style="font-style:normal">'+(c.isActive ? 'Aktiv' : 'Udløbet eller deaktiveret')+'</div>'+
+      '<div class="kv">'+
+        '<div class="k">Client id</div><div><span class="secret">'+esc(c.clientId)+'</span><button class="linkbtn" onclick="copyText(\''+esc(c.clientId)+'\')">Kopiér</button></div>'+
+        '<div class="k">Client secret</div><div>'+secret+'</div>'+
+        '<div class="k">Udløber</div><div>'+esc(exp)+'</div>'+
+      '</div>'+
+      '<div class="btnrow"><button class="ghost2" onclick="openLog(\''+esc(c.clientId)+'\',\''+esc(c.company).replace(/'/g,"\\'")+'\')">Ordre-log →</button></div>'+
+    '</div>';
+  }).join('') || '<div class="empty">Ingen API-adgang tilknyttet din bruger endnu.</div>';
+  $('#accStatus').textContent = '';
+}
+
+function toggleAccSecret(i) {
+  const el = $('#asec'+i), btn = $('#asecbtn'+i);
+  if (btn.textContent === 'Vis') { el.textContent = el.dataset.v; btn.textContent = 'Skjul'; }
+  else { el.textContent = '••••••••••••••••'; btn.textContent = 'Vis'; }
+}
+
+function copyText(v) {
+  navigator.clipboard.writeText(v).then(() => { $('#accStatus').textContent = 'Kopieret.'; });
+}
 $('#navDash').onclick = () => show('dashView');
 $('#navCompanies').onclick = () => show('companiesView');
 $('#navUsers').onclick = () => show('usersView');

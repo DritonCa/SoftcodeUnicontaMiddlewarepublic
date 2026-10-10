@@ -11,8 +11,8 @@ from Uniconta itself.
 Works with Magento, WooCommerce, Shopify apps, Umbraco or anything that can send an HTTP
 request.
 
-**Try it:** a public demo with fictional data runs at **https://demo.softcode.dk/swagger** –
-create a demo account at [softcode.dk/uniconta](https://softcode.dk/uniconta).
+**Try it:** create a demo account at **https://demo.softcode.dk** – you get your own
+fictional company, API credentials under *My access*, an order log, and Swagger once logged in.
 
 ---
 
@@ -116,7 +116,9 @@ dotnet run
 ```
 
 On first run the app creates a SQLite database and an API client with a random secret,
-printed once to the console. Swagger is at `/swagger` in development.
+printed once to the console. Swagger is at `/swagger` in development. The admin portal is at
+`/admin`; the first administrator can only be created from the server itself (loopback) or
+with the `X-Setup-Token` header matching `Admin:SetupToken`.
 
 To try it without Uniconta, set `Erp:DataSource` to `Demo`.
 
@@ -149,7 +151,9 @@ Use environment variables (`Section__Key`), user-secrets or a git-ignored
 | `Orders:DebtorGroups:{privat,cvr,ean}` | `PRIV`, `CVR`, `EAN` | Debtor group per customer type (must exist in Uniconta) |
 | `Orders:RequisitionFormat` | `Web order {0}` | Requisition on the sales order |
 | `Orders:DeleteOrderWhenInvoiced` | `true` | Remove the sales order from open orders once invoiced |
-| `Swagger:Enabled` | `false` | Swagger outside development (the demo turns it on) |
+| `Swagger:Enabled` | `false` | Swagger outside development (the demo turns it on); it then requires a portal login |
+| `Admin:SetupToken` | – | Lets the first administrator be created remotely (header `X-Setup-Token`) |
+| `Admin:SecureCookie` | `true` | Portal cookie only over HTTPS; set `false` only for local HTTP testing |
 | `Demo:AccountLifetimeDays` | `14` | How long a demo account works |
 | `Demo:TurnstileSecret` | – | Cloudflare Turnstile secret; when set, sign-up requires a token |
 | `Demo:AllowedOrigins` | – | Browser origins allowed to call the sign-up endpoint |

@@ -2,6 +2,7 @@ using System.ComponentModel.DataAnnotations;
 using System.Net.Mail;
 using System.Security.Cryptography;
 using Microsoft.AspNetCore.Cors;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.Options;
@@ -28,9 +29,12 @@ public class DemoController : ControllerBase
     private readonly SecretHasher _hasher;
     private readonly IHttpClientFactory _http;
     private readonly ILogger<DemoController> _logger;
+    private readonly IAdminUserService _users;
+    private readonly IDataProtector _secrets;
 
     public DemoController(IOptions<ErpOptions> erp, IOptions<DemoOptions> demo, AppDbContext db,
-                          SecretHasher hasher, IHttpClientFactory http, ILogger<DemoController> logger)
+                          SecretHasher hasher, IHttpClientFactory http, ILogger<DemoController> logger,
+                          IAdminUserService users, IDataProtectionProvider dp)
     {
         _erp = erp.Value;
         _demo = demo.Value;
@@ -38,11 +42,15 @@ public class DemoController : ControllerBase
         _hasher = hasher;
         _http = http;
         _logger = logger;
+        _users = users;
+        _secrets = dp.CreateProtector(AdminController.SecretPurpose);
     }
 
     /// <summary>
-    /// Create a demo account. Returns client credentials that work against fictional data
-    /// for a limited time. The secret is shown once.
+    /// Create a demo account: a portal user (log in with the e-mail and password) with its
+    /// own fictional company and API credentials. The user is signed in to the portal,
+    /// where the credentials and Swagger are available. Everything expires after the demo
+    /// period.
     /// </summary>
     /// <response code="200">The demo account was created.</response>
     /// <response code="400">Invalid input or the bot check failed.</response>
@@ -62,10 +70,16 @@ public class DemoController : ControllerBase
             return Ok(new DemoSignupResponse("demo-" + Guid.NewGuid().ToString("N")[..12], "", DateTime.UtcNow));
 
         if (!IsValidEmail(request.Email))
-            return BadRequest(new { error = "Please enter a valid e-mail address." });
+            return BadRequest(new { error = "Angiv en gyldig e-mailadresse." });
+        if ((request.Password ?? "").Length < 8)
+            return BadRequest(new { error = "Adgangskoden skal være mindst 8 tegn." });
+
+        var email = request.Email.Trim().ToLowerInvariant();
+        if (await _users.FindAsync(email) != null)
+            return Conflict(new { error = "Der findes allerede en konto med denne e-mail. Log ind i stedet." });
 
         if (!string.IsNullOrEmpty(_demo.TurnstileSecret) && !await TurnstileOk(request.TurnstileToken))
-            return BadRequest(new { error = "The bot check failed. Please try again." });
+            return BadRequest(new { error = "Bot-tjekket fejlede. Prøv igen." });
 
         var company = (request.Company ?? "").Trim();
         if (company.Length > 100)
@@ -74,7 +88,7 @@ public class DemoController : ControllerBase
         var tenant = new ApiTenant
         {
             Id = Guid.NewGuid(),
-            Name = $"Demo – {(company == "" ? "(no company)" : company)} <{request.Email.Trim()}>",
+            Name = $"Demo – {(company == "" ? "(intet firma)" : company)} <{email}>",
             IsActive = true,
         };
         var clientId = "demo-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(6)).ToLowerInvariant();
@@ -88,10 +102,20 @@ public class DemoController : ControllerBase
             TenantId = tenant.Id,
             ClientId = clientId,
             ClientSecretHash = _hasher.Hash(secret),
+            // Reversible copy so the user can see the secret again under "My access".
+            ClientSecretEnc = _secrets.Protect(secret),
             IsActive = true,
             ExpiresAt = expires,
         });
         await _db.SaveChangesAsync();
+
+        var (user, error) = await _users.CreateAsync(email, request.Password!, email, "viewer", new List<string> { clientId });
+        if (user == null)
+        {
+            _logger.LogWarning("Demo user for {ClientId} could not be created: {Error}", clientId, error);
+            return BadRequest(new { error = error ?? "Kontoen kunne ikke oprettes." });
+        }
+        await AdminController.SignInAsync(HttpContext, user.Username);
 
         _logger.LogInformation("Demo account {ClientId} created, expires {Expires:u}", clientId, expires);
         return Ok(new DemoSignupResponse(clientId, secret, expires));
@@ -130,6 +154,10 @@ public class DemoSignupRequest
 {
     [Required, MaxLength(200)]
     public string Email { get; set; } = "";
+
+    /// <summary>Password for the portal login (at least 8 characters).</summary>
+    [Required, MaxLength(200)]
+    public string? Password { get; set; }
 
     [MaxLength(200)]
     public string? Company { get; set; }

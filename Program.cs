@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
@@ -129,7 +130,9 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         // therefore sees plain HTTP, so SameAsRequest left the session cookie without
         // the Secure flag even though the browser was on HTTPS. The admin is reachable
         // over HTTPS only, so the flag can be unconditional.
-        options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+        options.Cookie.SecurePolicy = builder.Configuration.GetValue("Admin:SecureCookie", true)
+            ? CookieSecurePolicy.Always
+            : CookieSecurePolicy.SameAsRequest;
         options.ExpireTimeSpan      = TimeSpan.FromHours(8);
         options.SlidingExpiration   = true;
         // Return status codes instead of redirecting (the UI is a single page).
@@ -222,8 +225,29 @@ var app = builder.Build();
 app.UseCors();
 app.UseRateLimiter();
 
+// The portal is the front door; "/" has nothing else to show.
+app.MapGet("/", () => Results.Redirect("/admin")).ExcludeFromDescription();
+
 // Swagger is always on in development; elsewhere only when "Swagger:Enabled" is true
-// (the public demo), so a production install does not advertise its API.
+// (the public demo), and then only for users logged in to the portal: a visitor needs
+// an account before the API can be tried.
+if (!app.Environment.IsDevelopment() && app.Configuration.GetValue<bool>("Swagger:Enabled"))
+{
+    app.Use(async (context, next) =>
+    {
+        if (context.Request.Path.StartsWithSegments("/swagger"))
+        {
+            var auth = await context.AuthenticateAsync(SoftcodeUnicontaMiddleware.Controllers.AdminController.CookieScheme);
+            if (!auth.Succeeded)
+            {
+                context.Response.Redirect("/admin?next=swagger");
+                return;
+            }
+        }
+        await next();
+    });
+}
+
 if (app.Environment.IsDevelopment() || app.Configuration.GetValue<bool>("Swagger:Enabled"))
 {
     app.UseSwagger();

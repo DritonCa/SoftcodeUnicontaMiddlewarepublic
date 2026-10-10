@@ -28,8 +28,11 @@ namespace SoftcodeUnicontaMiddleware.Services
             if (username.Length < 3 || (password ?? string.Empty).Length < 8)
                 return null;
 
-            // Only ever create the very first admin through this path.
-            if (await _db.AdminUsers.AnyAsync())
+            // Only ever create the very first admin through this path. Customer (viewer)
+            // accounts from the demo sign-up do not count.
+            if (await _db.AdminUsers.AnyAsync(u => u.Role == AdminUser.RoleAdmin))
+                return null;
+            if (await _db.AdminUsers.AnyAsync(u => u.Username == username))
                 return null;
 
             var user = new AdminUser

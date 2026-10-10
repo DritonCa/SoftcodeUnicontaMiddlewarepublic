@@ -3,6 +3,29 @@
 All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.0] - 2026-10-11
+
+The demo is now portal-first: customers create a login, and Swagger is only available
+after logging in.
+
+### Added
+- Demo sign-up creates a portal user (e-mail + password) scoped to its own demo company and
+  signs it in. `POST /api/demo/signup` now requires `password` (min. 8 characters) and
+  returns 409 if the e-mail already has an account.
+- **My access** in the portal (`GET /admin/api/access`): client id, secret (reveal/copy),
+  expiry and a getting-started guide with a link to Swagger.
+- `/` redirects to `/admin`; the portal shows sign-up when `Erp:DataSource` is `Demo`.
+- `Admin:SetupToken` and `Admin:SecureCookie` settings.
+
+### Security
+- Swagger outside development requires a portal login (anonymous requests are sent to
+  `/admin?next=swagger`).
+- The first administrator can only be created from loopback or with `Admin:SetupToken`;
+  before, the first visitor to a fresh install could claim it. Customer accounts no longer
+  count as "setup done", so they cannot lock out the first admin either.
+- Non-admin users can no longer read the error log, list all companies with their secrets,
+  create companies, or change the secret of a company they do not have access to.
+
 ## [1.0.0] - 2026-10-11
 
 First public release of the standardised middleware.
